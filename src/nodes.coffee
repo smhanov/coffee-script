@@ -469,13 +469,15 @@ exports.Value = class Value extends Base
 # CoffeeScript passes through block comments as JavaScript block comments
 # at the same position.
 exports.Comment = class Comment extends Base
-  constructor: (@comment) ->
+  constructor: (@comment, @forCtor) ->
 
   isStatement:     YES
   makeReturn:      THIS
 
   compileNode: (o, level) ->
-    code = '/*' + multident(@comment, @tab) + '*/'
+    code = '/*' + multident(@comment, @tab)
+    # Close the comment unless its above a constructor when in closure mode
+    code += '*/' unless (@forCtor and o.closure and not o.closure_nodoc)
     code = o.indent + code if (level or o.level) is LEVEL_TOP
     code
 
@@ -1123,6 +1125,8 @@ exports.Code = class Code extends Base
 
   isStatement: -> !!@ctor
 
+  isGoogleConstructor: (o) -> (o.google or o.closure) and @ctor
+
   jumps: NO
 
   # Compilation creates a new scope unless explicitly asked to share with the
@@ -1159,33 +1163,170 @@ exports.Code = class Code extends Base
     @body.expressions.unshift exprs... if exprs.length
     o.scope.parameter vars[i] = v.compile o for v, i in vars unless splats
     @body.makeReturn() unless wasEmpty or @noReturn
-    idt   = o.indent
-    isGoogleConstructor = (o.google or o.closure) and @ctor
-    if isGoogleConstructor
+    idt = o.indent
+
+    # Generate Code
+    # -------------
+
+    # If previous node was a herecomment and this node is a constructor,
+    # it means we have cut off the closing tag of the comment. So we need 
+    # to add our comments and then close it.
+    code = ''
+
+    comments = @addFunctionComments o
+
+    # Add our generated JSDoc and open block if there wasn't a previous comment
+    if comments isnt ''
+      code += "#{@tab}/**\n" if not @getPreviousNodeIfComment(o)?
+      code += comments
+      code += "*/\n"
+    else
+      # Close the block if there was a previous comment
+      code += "*/\n" if @getPreviousNodeIfComment(o)?
+
+    # Add function declaration/assignment
+    code += @addFunctionDeclaration o
+
+    # Arguments
+    code += '(' + vars.join(', ') + ') {'
+
+    # Body
+    code += "\n#{ @body.compileWithDeclarations o }\n#{@tab}" unless @body.isEmpty()
+
+    code += @closeBlock o
+
+    return @tab + code if @ctor
+    return utility('bind', o) + "(#{code}, #{@context})" if @bound
+    if @front or (o.level >= LEVEL_ACCESS) then "(#{code})" else code
+
+  # Sections
+  # --------
+
+  # Add @constructor, except if the user-defined comment contains @interface.
+  # Also add @extends, and @params tags extracted from default arguments.
+  addFunctionComments: (o) ->
+    return '' if o.closure_nodoc
+    code = ''
+    code += @addParamAnnotations o
+    if @isGoogleConstructor o
+      # extends annotation and processing
+      extendsJsDoc = ""
       if @ctorParent
         parentClassName = @ctorParent.compile o
         o.google?.includes.push {name: parentClassName, alias: null}
-        extendsJsDoc = "#{@tab} * @extends {#{parentClassName}}\n"
-      else
-        extendsJsDoc = ''
+        extendsJsDoc = "#{@tab}@extends {#{parentClassName}}\n"
       o.google?.provides.push @name
-      code = """
-             #{@tab}/**
-             #{@tab} * @constructor
-             #{extendsJsDoc}#{@tab} */"""
-      if o.closure
-        # include var declaration for google without closure
-        code += "\nvar #{@tab}#{@name} = function"
-      else
-        # no var declaration
-        code += "\n#{@tab}#{@name} = function"
-    else
-      code  = 'function'
+      # Only add constructor if an interface annotation doesn't exist
+      comment = @getPreviousNodeIfComment(o)
+      # console.log "Comment: " + comment
+      unless comment? and comment?.search('@interface') isnt -1
+        code += "#{@tab}@constructor\n" 
+      code += "#{extendsJsDoc}#{@tab}"
+
+    return code
+
+  getPreviousNodeIfComment: (o) ->
+    topBlock = new Block o.scope.parent.expressions.expressions
+    previousNodeIsComment = false
+    # Find the node before this node
+    lastNode = null
+     # We use foundNode because contains is not breaking out of the loop properly
+     # when using return statements - might be a bug?
+    foundNode = false
+    topBlock.contains (node) =>
+      if @ctor isnt undefined and node.ctor is @ctor
+        foundNode = true
+        return true
+      lastNode = node if not foundNode
+      return false
+    # If its a comment we leave off the start tag of the jsdoc
+    return lastNode?.comment
+
+  extractMethodAsString: (value) ->
+
+  # Annotate arguments with default values with inline jsdoc for 
+  # Closure optional params and inferred type information
+  # TODO: Check if it is already defined in previous comment.
+  addParamAnnotations: (o) ->
+    code = ''
+    if o.closure and o.closure_infer
+      for param, i in @params
+
+        tMode = false
+        if param.value?.variable?.base?.value is '__'
+          # Type is form of `T(<type>, <default-value>)` to support default values
+          defaultParam = param.value?.args?[0]?.base.value
+          tMode = true
+          # TODO: If param.value?.args?[1]?
+          # ensure type is optional (ends in an equals or square brackets around name)
+        else if param.value?.base?.value?
+          # Type is just Closure annotation in string
+          defaultParam = param.value?.base?.value
+        else
+          # TODO: Currently not handling function(), etc.
+          # console.log param.value
+
+        # ref = param
+        # if param.value
+        #   lit = new Literal ref.name.value + ' == null'
+        #   val = new Assign new Value(param.name), param.value, '='
+        #   exprs.push new If lit, val
+        # console.log exprs
+
+        # types[i] = @type defaultParam # Infer type from value
+        # Check if surrounded in braces
+        name = param.name.value
+        re = RegExp /// 
+          ^             # beginning of string
+          # (?:T[/(])?    # optional T and bracket wrapping type string
+          [/']          # quote start
+          ([/{].*[/}])  # matching type string
+          [/']          # quote end
+          # (?:[/)])?     # end of wrapper optional wrapper function
+          $             # end of string
+        ///
+        m = re.exec defaultParam
+        if m?
+          code += "#{@tab}@param #{m[1]} #{name}\n"
+        else if tMode
+          # If its not a Google Closure type annotations
+          # we check if the user has entered a literal and try some basic type inference
+          # e.g. T(1) or T('something')
+          parsed = parseInt defaultParam 
+          if isNaN parsed
+            inference = @type defaultParam
+          else 
+            inference = @type parsed
+          if inference is 'function'
+            code += "#{@tab}@param {#{inference}()=} #{name}\n"            
+          else if inference isnt 'undefined'
+            code += "#{@tab}@param {#{inference}=} #{name}\n"
+
+    return code
+
+  # Add constructor declaration
+  #   foo.bar = function (...) {}
+  addFunctionDeclaration: (o) ->
+    code = ''
+    if not @isGoogleConstructor o
+      code  += 'function'
       code  += ' ' + @name if @ctor
-    code  += '(' + vars.join(', ') + ') {'
-    code  += "\n#{ @body.compileWithDeclarations o }\n#{@tab}" unless @body.isEmpty()
-    
-    if isGoogleConstructor
+    else if o.closure
+      namespaces = @name.split("\.")
+      if namespaces.length is 1
+        # include var declaration for google without closure
+        code += "var #{@tab}#{@name} = function"
+      else
+        # clazz = namespaces[namespaces.length - 1]
+        code += "#{@tab}#{@name} = function"
+    else
+      # no var declaration
+      code += "#{@tab}#{@name} = function"
+    return code
+
+  closeBlock: (o) ->
+    code = ''
+    if @isGoogleConstructor o
       code += '};'
       if @ctorParent
         extendsNode = new Extends (new Literal @name), @ctorParent
@@ -1193,15 +1334,30 @@ exports.Code = class Code extends Base
       code += '\n'
     else
       code += '}'
-
-    return @tab + code if @ctor
-    return utility('bind', o) + "(#{code}, #{@context})" if @bound
-    if @front or (o.level >= LEVEL_ACCESS) then "(#{code})" else code
+    return code
 
   # Short-circuit `traverseChildren` method to prevent it from crossing scope boundaries
   # unless `crossScope` is `true`.
   traverseChildren: (crossScope, func) ->
     super(crossScope, func) if crossScope
+
+  # Basic type inference
+  # TODO: Remove
+  type: (o) ->
+    TYPES =
+      'undefined'        : 'undefined',
+      'number'           : 'number',
+      'boolean'          : 'boolean',
+      'string'           : 'string',
+      '[object Function]': 'function',
+      '[object RegExp]'  : 'regexp',
+      '[object Array]'   : 'array',
+      '[object Date]'    : 'date',
+      '[object Error]'   : 'error'
+
+    TOSTRING = Object.prototype.toString
+
+    return TYPES[typeof o] or TYPES[TOSTRING.call(o)] or (o ? 'object' : 'null')
 
 #### Param
 
